@@ -1,6 +1,6 @@
 # pepperoniPaint
 
-A simple Paint application reminiscent of Windows 7 era MS Paint.
+A simple Paint application for Linux reminiscent of Windows 7 era MS Paint.
 
 ## Install
 
