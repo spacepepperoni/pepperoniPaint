@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDialog,
                              QToolButton, QVBoxLayout, QWidget, QWidgetAction)
 
 APP = "pepperoniPaint"
-__version__ = "0.3.1"       # bump to release: installs only offer updates when this goes up
+__version__ = "0.3.2"       # bump to release: installs only offer updates when this goes up
 REPO_URL = "https://github.com/spacepepperoni/pepperoniPaint"
 INSTALL_DIR = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), APP)
 UPDATE_EVERY_MS = 6 * 60 * 60 * 1000
@@ -1461,10 +1461,10 @@ class MainWindow(QMainWindow):
         self.updater.installed.connect(self.on_update_installed)
         self.skipped_version = None
         self.update_timer = QTimer(self)
-        self.update_timer.timeout.connect(lambda: self.updater.check(False))
+        self.update_timer.timeout.connect(self.auto_check)
         self.set_auto_update(self.a_autoupd.isChecked())
         if self.a_autoupd.isChecked():
-            QTimer.singleShot(5000, lambda: self.updater.check(False))
+            QTimer.singleShot(1500, self.auto_check)      # the launch check
 
     # ---- construction ----------------------------------------------
     def act(self, text, slot, shortcut=None, icons=None, checkable=False):
@@ -1965,6 +1965,7 @@ class MainWindow(QMainWindow):
             self.update_timer.stop()
 
     def on_update_found(self, version, notes, manual):
+        self.statusBar().clearMessage()
         if not manual and version == self.skipped_version:
             return          # "Later" was clicked this session; don't nag
         box = QMessageBox(self)
@@ -2010,13 +2011,23 @@ class MainWindow(QMainWindow):
         if QProcess.startDetached(sys.executable, args)[0]:
             self.close()
 
+    def auto_check(self):
+        # Automatic checks say so in the status bar, so a launch check is visible
+        # even when there is nothing new (the popup only appears for an update).
+        self.statusBar().showMessage("Checking for updates…")
+        self.updater.check(False)
+
     def on_up_to_date(self, manual):
         if manual:
             QMessageBox.information(self, "No updates", f"You're up to date ({APP} {__version__}).")
+        else:
+            self.statusBar().showMessage(f"Up to date ({APP} {__version__})", 5000)
 
     def on_update_failed(self, msg, manual):
         if manual:
             QMessageBox.warning(self, "Check for updates", msg)
+        else:
+            self.statusBar().showMessage("Couldn't check for updates", 5000)
 
     def about(self):
         QMessageBox.about(self, f"About {APP}",
