@@ -41,7 +41,7 @@ one repo and nothing else, so no GitHub login is stored on the device.
    ```
 2. Add that line on GitHub: repo → **Settings → Deploy keys → Add deploy key**.
    Leave *Allow write access* unticked.
-3. Clone and install with auto-update :
+3. Clone and install with auto-update:
    ```sh
    key='ssh -i ~/.ssh/pepperonipaint_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
    GIT_SSH_COMMAND="$key" git clone git@github.com:spacepepperoni/pepperoniPaint.git ~/pepperoniPaint
