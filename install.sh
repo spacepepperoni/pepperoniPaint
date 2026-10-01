@@ -1,24 +1,48 @@
 #!/usr/bin/env bash
 # Installs pepperoniPaint for the current user (no root needed for the app
-# itself). Re-run any time to update.
-#   ./install.sh          use the system PyQt6 (install it with your package manager)
-#   ./install.sh --venv   no root: put PyQt6 in a private venv (Steam Deck etc.)
-#   --auto-update         also install a systemd user timer that runs update.sh
-#                         (checks GitHub ~10 min after login, then every 6 hours)
+# itself). Re-run any time to reinstall.
+#   ./install.sh              use the system PyQt6 (install it with your package manager)
+#   ./install.sh --venv       no root: put PyQt6 in a private venv (Steam Deck etc.)
+#   ./install.sh --uninstall  remove pepperoniPaint (keeps your settings)
+# Updates are handled by the app itself (File → Check for updates).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 share="${XDG_DATA_HOME:-$HOME/.local/share}"
 dest="$share/pepperoniPaint"
 bin="$HOME/.local/bin"
+units="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 use_venv=0
-auto_update=0
+uninstall=0
 for arg in "$@"; do
   case "$arg" in
     --venv) use_venv=1 ;;
-    --auto-update) auto_update=1 ;;
+    --uninstall) uninstall=1 ;;
+    --auto-update) ;;   # 0.1.0's background timer; the app checks for updates itself now
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
+
+refresh_menus() {
+  command -v update-desktop-database >/dev/null && update-desktop-database -q "$share/applications" || true
+  command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 >/dev/null 2>&1 || true
+}
+
+# 0.1.0 installed a systemd timer that updated silently. The app now asks before
+# updating, so the timer goes away on every (re)install.
+if [[ -e "$units/pepperonipaint-update.timer" ]]; then
+  systemctl --user disable --now pepperonipaint-update.timer >/dev/null 2>&1 || true
+  rm -f "$units/pepperonipaint-update.timer" "$units/pepperonipaint-update.service"
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+fi
+
+if (( uninstall )); then
+  rm -rf "$dest" "$bin/pepperonipaint" "$share/applications/pepperonipaint.desktop" \
+         "$share/icons/hicolor/scalable/apps/pepperonipaint.svg"
+  refresh_menus
+  echo "pepperoniPaint is uninstalled."
+  exit 0
+fi
+
 [[ -x "$dest/venv/bin/python" ]] && use_venv=1   # once a venv, always (update.sh passes no flags)
 . /etc/os-release 2>/dev/null || true
 [[ "${ID:-}" == "steamos" ]] && use_venv=1     # read-only root: venv is the only way
@@ -54,12 +78,16 @@ fi
 
 mkdir -p "$dest" "$bin" "$share/applications" "$share/icons/hicolor/scalable/apps"
 install -m 644 "$here/pepperoni_paint.py" "$dest/pepperoni_paint.py"
+install -m 644 "$here/pepperonipaint.svg" "$dest/pepperonipaint.svg"
 install -m 644 "$here/pepperonipaint.svg" "$share/icons/hicolor/scalable/apps/pepperonipaint.svg"
+printf '%s\n' "$here" > "$dest/source-path"     # where the app's updater pulls from
 cat > "$bin/pepperonipaint" <<LAUNCH
 #!/bin/sh
 exec "$py" "$dest/pepperoni_paint.py" "\$@"
 LAUNCH
 chmod 755 "$bin/pepperonipaint"
+# Icon is an absolute path: a theme name can stay invisible until Plasma's icon
+# cache notices the new ~/.local/share/icons directory (often not until re-login).
 cat > "$share/applications/pepperonipaint.desktop" <<DESK
 [Desktop Entry]
 Type=Application
@@ -67,43 +95,11 @@ Name=pepperoniPaint
 GenericName=Paint
 Comment=Paste, select, move and draw — a Windows 7-style Paint
 Exec="$bin/pepperonipaint" %f
-Icon=pepperonipaint
+Icon=$dest/pepperonipaint.svg
 Terminal=false
 Categories=Graphics;2DGraphics;RasterGraphics;
 MimeType=image/png;image/jpeg;image/bmp;image/webp;image/gif;
 StartupWMClass=pepperoniPaint
 DESK
-command -v update-desktop-database >/dev/null && update-desktop-database -q "$share/applications" || true
-command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 >/dev/null 2>&1 || true
-if (( auto_update )); then
-  units="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-  mkdir -p "$units"
-  cat > "$units/pepperonipaint-update.service" <<UNIT
-[Unit]
-Description=Update pepperoniPaint from GitHub
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart="$here/update.sh"
-UNIT
-  cat > "$units/pepperonipaint-update.timer" <<UNIT
-[Unit]
-Description=Check for pepperoniPaint updates
-
-[Timer]
-OnStartupSec=10min
-OnUnitActiveSec=6h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-UNIT
-  if systemctl --user daemon-reload && systemctl --user enable --now pepperonipaint-update.timer; then
-    echo "Auto-update on: checks ~10 min after login, then every 6 h (journalctl --user -u pepperonipaint-update)"
-  else
-    echo "Couldn't turn on auto-update (no systemd user session?). Update by hand with: $here/update.sh"
-  fi
-fi
+refresh_menus
 echo "Installed. Launch \"pepperoniPaint\" from the app menu, or run: $bin/pepperonipaint [file]"

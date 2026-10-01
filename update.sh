@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# Pull the latest pepperoniPaint and reinstall, but only if something changed.
-# Run by the pepperonipaint-update systemd user timer (./install.sh --auto-update),
-# or by hand any time.
+# Pull the latest pepperoniPaint and reinstall it.
+# Run by the app (File → Check for updates), or by hand any time.
 set -euo pipefail
 cd "$(dirname "$0")"
 git fetch -q
-local_rev=$(git rev-parse HEAD)
-remote_rev=$(git rev-parse '@{u}')
-if [[ "$local_rev" == "$remote_rev" ]]; then
-  echo "pepperoniPaint is up to date ($(git log -1 --format='%h %s'))"
-  exit 0
-fi
+before=$(git rev-parse --short HEAD)
 git merge -q --ff-only '@{u}'
-echo "Updated pepperoniPaint ${local_rev:0:7} → $(git log -1 --format='%h %s')"
+after=$(git rev-parse --short HEAD)
+if [[ "$before" == "$after" ]]; then
+  echo "Already at $(git log -1 --format='%h %s'); reinstalling"
+else
+  echo "Updated pepperoniPaint $before → $(git log -1 --format='%h %s')"
+fi
 ./install.sh

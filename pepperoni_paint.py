@@ -10,20 +10,27 @@ shows at exactly the size it was captured.
 """
 import math
 import os
+import re
+import subprocess
 import sys
+import threading
 
-from PyQt6.QtCore import (QPoint, QPointF, QRect, QRectF, QSettings, QSize,
-                          Qt, QTimer, pyqtSignal)
+from PyQt6.QtCore import (QPoint, QPointF, QProcess, QRect, QRectF, QSettings, QSize,
+                          QObject, Qt, QTimer, pyqtSignal)
 from PyQt6.QtGui import (QAction, QActionGroup, QColor, QCursor, QIcon,
                          QImage, QImageReader, QImageWriter, QKeySequence,
-                         QPainter, QPen, QPixmap, QTransform)
+                         QPainter, QPalette, QPen, QPixmap, QTransform)
 from PyQt6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDialog,
                              QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout,
                              QHBoxLayout, QLabel, QMainWindow, QMenu,
-                             QMessageBox, QScrollArea, QSpinBox, QToolBar,
+                             QMessageBox, QProgressDialog, QScrollArea, QSpinBox, QToolBar,
                              QToolButton, QVBoxLayout, QWidget)
 
 APP = "pepperoniPaint"
+__version__ = "0.2.0"       # bump to release: installs only offer updates when this goes up
+REPO_URL = "https://github.com/spacepepperoni/pepperoniPaint"
+INSTALL_DIR = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), APP)
+UPDATE_EVERY_MS = 6 * 60 * 60 * 1000
 RGB32 = QImage.Format.Format_RGB32
 MARGIN = 8          # logical px of workspace around the canvas
 HANDLE = 6          # logical px, resize handle squares
@@ -67,6 +74,14 @@ def swatch_icon(color, size=22):
     p.drawRect(0, 0, size - 1, size - 1)
     p.end()
     return QIcon(pm)
+
+
+def workspace_color(pal):
+    """The grey area around the canvas. Like Win7 Paint's app-workspace color, it
+    follows the system theme: a shade darker than the window, so pure-black
+    themes stay black and light themes get a soft grey."""
+    w = pal.color(QPalette.ColorRole.Window)
+    return w.darker(140) if w.lightness() < 128 else w.darker(112)
 
 
 def opaque(img):
@@ -157,6 +172,84 @@ def flood_fill(img, x, y, color):
     return QImage(bytes(b), w, h, bpl, RGB32).copy()
 
 
+def version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3]) or (0,)
+
+
+def source_dir():
+    """The git clone this copy was installed from (install.sh records it)."""
+    try:
+        with open(os.path.join(INSTALL_DIR, "source-path")) as f:
+            p = f.read().strip()
+    except OSError:
+        return None
+    return p if os.path.isdir(os.path.join(p, ".git")) else None
+
+
+class Updater(QObject):
+    """Asks GitHub (through the install's git clone) whether a newer version
+    exists, and installs it with the clone's update.sh. All git work happens on
+    a worker thread; results come back as queued signals."""
+    found = pyqtSignal(str, str, bool)      # version, what's new, manual
+    current = pyqtSignal(bool)              # manual
+    failed = pyqtSignal(str, bool)          # message, manual
+    installed = pyqtSignal(bool, str)       # ok, output
+
+    def __init__(self):
+        super().__init__()
+        self.busy = False
+
+    def _git(self, src, *args):
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0", LC_ALL="C")
+        return subprocess.run(["git", "-C", src, *args], capture_output=True, text=True,
+                              timeout=90, env=env)
+
+    def check(self, manual):
+        if self.busy:
+            return
+        src = source_dir()
+        if not src:
+            self.failed.emit("This copy of pepperoniPaint wasn't installed with the installer, "
+                             "so it can't update itself.", manual)
+            return
+        self.busy = True
+        threading.Thread(target=self._check, args=(src, manual), daemon=True).start()
+
+    def _check(self, src, manual):
+        try:
+            r = self._git(src, "fetch", "-q")
+            if r.returncode:
+                raise RuntimeError(r.stderr.strip() or "git fetch failed")
+            r = self._git(src, "show", "@{u}:pepperoni_paint.py")
+            m = re.search(r'^__version__ = "([^"]+)"', r.stdout, re.M)
+            latest = m.group(1) if m else "0"
+            if version_tuple(latest) > version_tuple(__version__):
+                log = self._git(src, "log", "--format=%s", "HEAD..@{u}").stdout.split("\n")
+                notes = [l for l in log if l.strip()][:10]
+                self.found.emit(latest, "\n".join(notes), manual)
+            else:
+                self.current.emit(manual)
+        except Exception as e:      # offline, git missing, timeout...
+            self.failed.emit(f"Couldn't check for updates:\n{e}", manual)
+        finally:
+            self.busy = False
+
+    def install(self):
+        src = source_dir()
+        self.busy = True
+
+        def run():
+            try:
+                r = subprocess.run([os.path.join(src, "update.sh")], capture_output=True, text=True,
+                                   timeout=900, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+                self.installed.emit(r.returncode == 0, (r.stdout + r.stderr).strip())
+            except Exception as e:
+                self.installed.emit(False, str(e))
+            finally:
+                self.busy = False
+        threading.Thread(target=run, daemon=True).start()
+
+
 class Canvas(QWidget):
     docChanged = pyqtSignal()
     status = pyqtSignal(str, str)          # cursor position, selection size
@@ -183,6 +276,7 @@ class Canvas(QWidget):
         self.color1, self.color2 = QColor("#000000"), QColor("#ffffff")
         self._dpr = None
         self._wheel = 0
+        self.workspace = QColor("#808080")
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
@@ -817,7 +911,7 @@ class Canvas(QWidget):
             if not first:
                 QTimer.singleShot(0, self.update_size)
         p = QPainter(self)
-        p.fillRect(e.rect(), self.palette().color(self.palette().ColorRole.Dark))
+        p.fillRect(e.rect(), self.workspace)
         s = self.scale()
         W, H = self.image.width(), self.image.height()
         p.save()
@@ -922,9 +1016,9 @@ class MainWindow(QMainWindow):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(False)
         self.scroll.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        self.scroll.setBackgroundRole(self.palette().ColorRole.Dark)
         self.canvas = Canvas(self.scroll)
         self.scroll.setWidget(self.canvas)
+        self.apply_workspace_color()
         self.setCentralWidget(self.scroll)
         self.setAcceptDrops(True)
         self.build_actions()
@@ -946,6 +1040,17 @@ class MainWindow(QMainWindow):
         self.on_tool_changed(self.canvas.tool)
         self.refresh_colors()
         self.refresh()
+        self.updater = Updater()
+        self.updater.found.connect(self.on_update_found)
+        self.updater.current.connect(self.on_up_to_date)
+        self.updater.failed.connect(self.on_update_failed)
+        self.updater.installed.connect(self.on_update_installed)
+        self.skipped_version = None
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(lambda: self.updater.check(False))
+        self.set_auto_update(self.a_autoupd.isChecked())
+        if self.a_autoupd.isChecked():
+            QTimer.singleShot(5000, lambda: self.updater.check(False))
 
     # ---- construction ----------------------------------------------
     def act(self, text, slot, shortcut=None, icons=None, checkable=False):
@@ -966,6 +1071,12 @@ class MainWindow(QMainWindow):
         self.a_save = self.act("&Save", self.save, "Ctrl+S", ["document-save"])
         self.a_saveas = self.act("Save &as…", self.save_as, "Ctrl+Shift+S", ["document-save-as"])
         self.a_quit = self.act("E&xit", self.close, "Ctrl+Q", ["application-exit"])
+        self.a_checkupd = self.act("Check for &updates…", lambda: self.updater.check(True), None,
+                                   ["update-none", "system-software-update"])
+        self.a_autoupd = self.act("&Automatic updates", self.set_auto_update, None, None, True)
+        self.a_autoupd.setChecked(self.settings.value("auto_update", True, type=bool))
+        self.a_autoupd.setToolTip("Check for new versions at startup and every 6 hours, and ask before installing")
+        self.a_about = self.act(f"&About {APP}", self.about, None, ["help-about"])
         self.a_undo = self.act("&Undo", c.undo, "Ctrl+Z", ["edit-undo"])
         self.a_redo = self.act("&Redo", c.redo, ["Ctrl+Y", "Ctrl+Shift+Z"], ["edit-redo"])
         self.a_cut = self.act("Cu&t", self.cut, "Ctrl+X", ["edit-cut"])
@@ -1004,7 +1115,8 @@ class MainWindow(QMainWindow):
     def build_menus(self):
         mb = self.menuBar()
         m = mb.addMenu("&File")
-        for a in (self.a_new, self.a_open, None, self.a_save, self.a_saveas, None, self.a_quit):
+        for a in (self.a_new, self.a_open, None, self.a_save, self.a_saveas, None,
+                  self.a_checkupd, self.a_autoupd, None, self.a_quit):
             m.addSeparator() if a is None else m.addAction(a)
         m = mb.addMenu("&Edit")
         for a in (self.a_undo, self.a_redo, None, self.a_cut, self.a_copy, self.a_paste, self.a_paste_file,
@@ -1017,6 +1129,7 @@ class MainWindow(QMainWindow):
         m = mb.addMenu("&View")
         for a in (self.a_zin, self.a_zout, self.a_z100, self.a_zfit):
             m.addAction(a)
+        mb.addMenu("&Help").addAction(self.a_about)
 
     def tool_button(self, action=None, text=None, icons=None, big=False, menu=None):
         b = QToolButton()
@@ -1352,6 +1465,90 @@ class MainWindow(QMainWindow):
         if d.exec():
             self.canvas.resize_canvas(d.w.value(), d.h.value())
 
+    # ---- theme -----------------------------------------------------
+    def apply_workspace_color(self):
+        ws = workspace_color(self.palette())
+        self.canvas.workspace = ws
+        vp = self.scroll.viewport()
+        pal = vp.palette()
+        pal.setColor(QPalette.ColorRole.Window, ws)
+        vp.setPalette(pal)
+        vp.setAutoFillBackground(True)
+        self.canvas.update()
+
+    def changeEvent(self, e):
+        if e.type() in (e.Type.PaletteChange, e.Type.ApplicationPaletteChange) and hasattr(self, "canvas"):
+            self.apply_workspace_color()
+        super().changeEvent(e)
+
+    # ---- updates ---------------------------------------------------
+    def set_auto_update(self, on):
+        self.settings.setValue("auto_update", bool(on))
+        if on:
+            self.update_timer.start(UPDATE_EVERY_MS)
+        else:
+            self.update_timer.stop()
+
+    def on_update_found(self, version, notes, manual):
+        if not manual and version == self.skipped_version:
+            return          # "Later" was clicked this session; don't nag
+        box = QMessageBox(self)
+        box.setWindowTitle("Update available")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(f"<b>{APP} {version}</b> is available.<br>You have {__version__}.")
+        if notes:
+            box.setInformativeText("What's new:\n" + "\n".join("• " + n for n in notes.split("\n")))
+        upd = box.addButton("Update now", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(upd)
+        box.exec()
+        if box.clickedButton() is not upd:
+            self.skipped_version = version
+            return
+        self.progress = QProgressDialog(f"Installing {APP} {version}…", None, 0, 0, self)
+        self.progress.setWindowTitle("Updating")
+        self.progress.setMinimumDuration(0)
+        self.progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress.show()
+        self.updating_to = version
+        self.updater.install()
+
+    def on_update_installed(self, ok, output):
+        self.progress.close()
+        if not ok:
+            QMessageBox.warning(self, "Update failed", f"The update didn't install:\n\n{output[-1500:]}")
+            return
+        r = QMessageBox.question(self, "Update installed",
+                                 f"{APP} {self.updating_to} is installed.\nRestart now to use it?",
+                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if r == QMessageBox.StandardButton.Yes:
+            self.restart()
+
+    def restart(self):
+        if not self.maybe_save():
+            return
+        self.canvas.modified = False            # already asked; don't ask again on close
+        script = os.path.join(INSTALL_DIR, "pepperoni_paint.py")
+        if not os.path.isfile(script):
+            script = os.path.abspath(__file__)
+        args = [script] + ([self.path] if self.path else [])
+        if QProcess.startDetached(sys.executable, args)[0]:
+            self.close()
+
+    def on_up_to_date(self, manual):
+        if manual:
+            QMessageBox.information(self, "No updates", f"You're up to date ({APP} {__version__}).")
+
+    def on_update_failed(self, msg, manual):
+        if manual:
+            QMessageBox.warning(self, "Check for updates", msg)
+
+    def about(self):
+        QMessageBox.about(self, f"About {APP}",
+                          f"<b>{APP} {__version__}</b><br>A simple Paint for Linux, "
+                          f"reminiscent of Windows 7 Paint.<br><br>"
+                          f'<a href="{REPO_URL}">{REPO_URL}</a><br>MIT License')
+
     def closeEvent(self, e):
         if not self.maybe_save():
             e.ignore()
@@ -1364,6 +1561,11 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP)
     app.setDesktopFileName("pepperonipaint")
+    for ico in (os.path.join(INSTALL_DIR, "pepperonipaint.svg"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "pepperonipaint.svg")):
+        if os.path.isfile(ico):
+            app.setWindowIcon(QIcon(ico))
+            break
     w = MainWindow()
     w.show()
     w.canvas.setFocus()

@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/spacepepperoni/pepperoniPaint/main/get.sh | bash
 #
-# Installs for your user only (~/.local) and turns on automatic updates.
+# Installs for your user only (~/.local). The app checks for updates itself.
 # The only thing that may ask for your password is installing PyQt6 (and git)
 # from your distro, if they're missing. Safe to run again any time.
 set -euo pipefail
@@ -11,7 +11,7 @@ set -euo pipefail
 main() {   # everything lives in a function so `curl | bash` reads the whole script first
   local repo="https://github.com/spacepepperoni/pepperoniPaint.git"
   local src="${XDG_DATA_HOME:-$HOME/.local/share}/pepperoniPaint/source"
-  local flags=(--auto-update) need=() pm=()
+  local flags=() need=() pm=()
   say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 
   . /etc/os-release 2>/dev/null || true
@@ -52,7 +52,7 @@ main() {   # everything lives in a function so `curl | bash` reads the whole scr
     mkdir -p "$(dirname "$src")"
     git clone -q --depth 1 "$repo" "$src"
   fi
-  "$src/install.sh" "${flags[@]}"
+  "$src/install.sh" ${flags[@]+"${flags[@]}"}
   say "Done! Open pepperoniPaint from your app menu."
 }
 
