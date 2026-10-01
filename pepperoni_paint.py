@@ -17,23 +17,27 @@ import threading
 
 from PyQt6.QtCore import (QPoint, QPointF, QProcess, QRect, QRectF, QSettings, QSize,
                           QObject, Qt, QTimer, pyqtSignal)
-from PyQt6.QtGui import (QAction, QActionGroup, QColor, QCursor, QIcon,
-                         QImage, QImageReader, QImageWriter, QKeySequence,
-                         QPainter, QPalette, QPen, QPixmap, QTransform)
+from PyQt6.QtGui import (QAbstractTextDocumentLayout, QAction, QActionGroup,
+                         QColor, QCursor, QFont, QFontDatabase, QIcon, QImage,
+                         QImageReader, QImageWriter, QIntValidator, QKeySequence,
+                         QPainter, QPalette, QPen, QPixmap, QPolygonF, QTextCharFormat,
+                         QTextCursor, QTextDocument, QTransform)
 from PyQt6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDialog,
                              QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout,
                              QHBoxLayout, QLabel, QMainWindow, QMenu,
                              QMessageBox, QProgressDialog, QScrollArea, QSpinBox, QToolBar,
-                             QToolButton, QVBoxLayout, QWidget)
+                             QToolButton, QVBoxLayout, QWidget, QWidgetAction)
 
 APP = "pepperoniPaint"
-__version__ = "0.2.0"       # bump to release: installs only offer updates when this goes up
+__version__ = "0.3.0"       # bump to release: installs only offer updates when this goes up
 REPO_URL = "https://github.com/spacepepperoni/pepperoniPaint"
 INSTALL_DIR = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), APP)
 UPDATE_EVERY_MS = 6 * 60 * 60 * 1000
 RGB32 = QImage.Format.Format_RGB32
-MARGIN = 8          # logical px of workspace around the canvas
-HANDLE = 6          # logical px, resize handle squares
+MARGIN = 14         # logical px of workspace around the canvas (room for its handles)
+HANDLE = 6          # logical px, selection / text box handle squares
+CANVAS_HANDLE = 9   # logical px, canvas resize handles
+ROT_OFFSET = 24     # logical px from a selection's edge to its rotation knob
 UNDO_BYTES = 600 * 1024 * 1024
 UNDO_STEPS = 100
 ZOOMS = [0.125, 0.25, 0.5, 1, 2, 3, 4, 5, 6, 7, 8]
@@ -55,7 +59,16 @@ TOOLS = {   # id: (label, theme icons, key, default size, sizes)
     "eraser": ("Eraser", ["draw-eraser", "edit-clear"], "E", 8, [4, 6, 8, 10, 16, 24]),
     "line": ("Line", ["draw-line"], "L", 3, [1, 2, 3, 5, 8]),
     "rect": ("Rectangle", ["draw-rectangle"], "R", 3, [1, 2, 3, 5, 8]),
+    "text": ("Text", ["draw-text", "insert-text"], "T", 0, []),
 }
+
+# Offered in the Text group when installed; the generic names always resolve.
+COMMON_FONTS = ["Sans Serif", "Serif", "Monospace",
+                "Noto Sans", "DejaVu Sans", "Liberation Sans", "Arial", "Ubuntu", "Cantarell",
+                "Noto Serif", "DejaVu Serif", "Liberation Serif", "Times New Roman", "Georgia",
+                "DejaVu Sans Mono", "Liberation Mono", "Courier New", "Hack",
+                "Comic Neue", "Comic Sans MS", "Impact"]
+FONT_SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48, 72]
 
 
 def icon(names):
@@ -74,6 +87,34 @@ def swatch_icon(color, size=22):
     p.drawRect(0, 0, size - 1, size - 1)
     p.end()
     return QIcon(pm)
+
+
+def size_icon(size, square, w, h, color):
+    """A dot (or square, for the eraser) as big as the brush, like Paint's size list."""
+    dpr = QApplication.instance().devicePixelRatio()
+    pm = QPixmap(round(w * dpr), round(h * dpr))
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(color)
+    d = max(1.5, min(float(size), h - 4.0))
+    r = QRectF((w - d) / 2, (h - d) / 2, d, d)
+    p.drawRect(r) if square else p.drawEllipse(r)
+    p.end()
+    return QIcon(pm)
+
+
+def available_fonts():
+    have = {f.lower(): f for f in QFontDatabase.families()}
+    out = []
+    for f in COMMON_FONTS:
+        if f in ("Sans Serif", "Serif", "Monospace"):
+            out.append(f)
+        elif f.lower() in have and have[f.lower()] not in out:
+            out.append(have[f.lower()])
+    return out
 
 
 def workspace_color(pal):
@@ -250,6 +291,53 @@ class Updater(QObject):
         threading.Thread(target=run, daemon=True).start()
 
 
+class TextBox:
+    """A text box being typed into. Laid out in IMAGE pixels against a QImage
+    paint device, and previewed by rendering exactly what will be stamped."""
+    _metrics = QImage(1, 1, QImage.Format.Format_ARGB32_Premultiplied)
+
+    def __init__(self, rect):
+        self.rect = QRect(rect)
+        self.min_h = rect.height()
+        self.doc = QTextDocument()
+        self.doc.setDocumentMargin(2)
+        self.doc.documentLayout().setPaintDevice(self._metrics)
+        self.cursor = QTextCursor(self.doc)
+
+    def layout(self, font):
+        self.doc.setDefaultFont(font)
+        self.doc.setTextWidth(self.rect.width())
+        self.rect.setHeight(max(self.min_h, math.ceil(self.doc.size().height())))
+
+    def hit(self, local):
+        pos = self.doc.documentLayout().hitTest(QPointF(local), Qt.HitTestAccuracy.FuzzyHit)
+        return pos if pos >= 0 else self.doc.characterCount() - 1
+
+    def render(self, fg, bg, caret=False, highlight=None):
+        img = QImage(self.rect.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(bg if bg is not None else Qt.GlobalColor.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        ctx = QAbstractTextDocumentLayout.PaintContext()
+        pal = QPalette(ctx.palette)
+        pal.setColor(QPalette.ColorRole.Text, fg)
+        ctx.palette = pal
+        if caret:
+            ctx.cursorPosition = self.cursor.position()
+            if self.cursor.hasSelection() and highlight is not None:
+                sel = QAbstractTextDocumentLayout.Selection()
+                sel.cursor = QTextCursor(self.cursor)
+                fmt = QTextCharFormat()
+                fmt.setBackground(highlight[0])
+                fmt.setForeground(highlight[1])
+                sel.format = fmt
+                ctx.selections = [sel]
+        self.doc.documentLayout().draw(p, ctx)
+        p.end()
+        return img
+
+
 class Canvas(QWidget):
     docChanged = pyqtSignal()
     status = pyqtSignal(str, str)          # cursor position, selection size
@@ -274,9 +362,13 @@ class Canvas(QWidget):
         self.tool, self.prev_tool = "pencil", "pencil"
         self.sizes = {k: v[3] for k, v in TOOLS.items()}
         self.color1, self.color2 = QColor("#000000"), QColor("#ffffff")
-        self._dpr = None
+        self._size_dpr = None
         self._wheel = 0
         self.workspace = QColor("#808080")
+        self.rot = None             # {"src", "angle", "key"}: free-rotation state of the selection
+        self.text = None            # TextBox being typed into
+        self.text_style = {"family": "Sans Serif", "pt": 12, "bold": False, "italic": False,
+                           "underline": False, "opaque": False}
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
@@ -305,6 +397,7 @@ class Canvas(QWidget):
         if self.drag and self.drag["kind"] == "canvas":
             w, h = max(w, self.drag["size"].width()), max(h, self.drag["size"].height())
         self.resize(math.ceil(2 * MARGIN + w * s), math.ceil(2 * MARGIN + h * s))
+        self._size_dpr = self.dpr()
         self.update()
 
     def visible_origin(self):
@@ -394,29 +487,182 @@ class Canvas(QWidget):
         self.docChanged.emit()
 
     # ---- selection --------------------------------------------------
-    def float_display(self):
-        f = self.floating
-        key = (f.cacheKey(), self.transparent, self.color2.rgb())
+    def masked(self, f):
+        """f with Color 2 see-through when Transparent selection is on (cached)."""
+        if not self.transparent:
+            return f
+        key = (f.cacheKey(), self.color2.rgb())
         if key != self._disp_key:
             self._disp_key = key
-            if self.transparent:
-                img = f.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
-                mask = f.convertToFormat(QImage.Format.Format_ARGB32).createMaskFromColor(
-                    self.color2.rgb(), Qt.MaskMode.MaskOutColor)
-                mask.setColorTable([0x00000000, 0xFFFFFFFF])
-                p = QPainter(img)
-                p.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
-                p.drawImage(0, 0, mask.convertToFormat(QImage.Format.Format_ARGB32))
-                p.end()
-                self._disp = img
-            else:
-                self._disp = f
+            img = f.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+            mask = f.convertToFormat(QImage.Format.Format_ARGB32).createMaskFromColor(
+                self.color2.rgb(), Qt.MaskMode.MaskOutColor)
+            mask.setColorTable([0x00000000, 0xFFFFFFFF])
+            p = QPainter(img)
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+            p.drawImage(0, 0, mask.convertToFormat(QImage.Format.Format_ARGB32))
+            p.end()
+            self._disp = img
         return self._disp
 
     def draw_floating(self, p):
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform,
                         self.sel.size() != self.floating.size())
-        p.drawImage(QRectF(self.sel), self.float_display(), QRectF(self.floating.rect()))
+        p.drawImage(QRectF(self.sel), self.masked(self.floating), QRectF(self.floating.rect()))
+
+    # ---- free rotation ---------------------------------------------
+    def rot_knob(self):
+        """Widget position of the selection's rotation knob (above it, or below
+        when the selection hugs the top of the view)."""
+        r = self.to_widget(self.sel)
+        y = r.top() - ROT_OFFSET
+        if y < HANDLE:
+            y = r.bottom() + ROT_OFFSET
+        return QPointF(r.center().x(), y)
+
+    def begin_rotate(self, ip):
+        self.lift()
+        if (not self.rot or self.rot["key"] != self.floating.cacheKey()
+                or self.rot["size"] != self.sel.size()):
+            # rotate from an unrotated source each time, so repeated turns don't blur
+            src = self.floating
+            if src.size() != self.sel.size():
+                src = src.scaled(self.sel.size(), Qt.AspectRatioMode.IgnoreAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+            self.rot = {"src": src.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied),
+                        "angle": 0.0, "key": None, "size": None}
+        c = QRectF(self.sel).center()
+        return {"kind": "rotate_sel", "center": c, "base": self.rot["angle"], "angle": self.rot["angle"],
+                "start": math.degrees(math.atan2(ip.y() - c.y(), ip.x() - c.x()))}
+
+    def draw_rotating(self, p):
+        d, src = self.drag, self.rot["src"]
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.translate(d["center"])
+        p.rotate(d["angle"])
+        p.drawImage(QPointF(-src.width() / 2, -src.height() / 2), self.masked(src))
+        p.restore()
+
+    def end_rotate(self, d):
+        src, ang = self.rot["src"], d["angle"]
+        out = src if ang % 360 == 0 else src.transformed(QTransform().rotate(ang),
+                                                          Qt.TransformationMode.SmoothTransformation)
+        c = d["center"]
+        self.sel = QRect(round(c.x() - out.width() / 2), round(c.y() - out.height() / 2),
+                         out.width(), out.height())
+        self.floating = out
+        self.rot.update(angle=ang, key=out.cacheKey(), size=self.sel.size())
+        self.emit_sel()
+
+    # ---- text --------------------------------------------------------
+    def text_font(self):
+        st = self.text_style
+        f = QFont(st["family"])
+        f.setPixelSize(max(1, round(st["pt"] * 96 / 72)))     # Paint's points at 96 dpi
+        f.setBold(st["bold"])
+        f.setItalic(st["italic"])
+        f.setUnderline(st["underline"])
+        return f
+
+    def set_text_style(self, **kw):
+        self.text_style.update(kw)
+        if self.text:
+            self.text.layout(self.text_font())
+            self.update()
+            self.setFocus()
+
+    def text_image(self, caret):
+        pal = self.palette()
+        hl = (pal.color(QPalette.ColorRole.Highlight), pal.color(QPalette.ColorRole.HighlightedText))
+        self.text.layout(self.text_font())
+        return self.text.render(self.color1, self.color2 if self.text_style["opaque"] else None,
+                                caret, hl)
+
+    def new_text(self, rect):
+        tb = TextBox(rect)
+        tb.min_h = 0
+        tb.layout(self.text_font())                 # height of one empty line
+        tb.min_h = max(rect.height(), tb.rect.height())
+        tb.layout(self.text_font())
+        self.text = tb
+        self.setFocus()
+        self.update()
+
+    def commit_text(self):
+        if not self.text:
+            return
+        if self.text.doc.toPlainText().strip():
+            img = self.text_image(caret=False)
+            self.push_undo()
+            p = QPainter(self.image)
+            p.drawImage(self.text.rect.topLeft(), img)
+            p.end()
+        self.text = None
+        self.update()
+        self.update_cursor()
+
+    def text_key(self, e):
+        """Typing into the active text box. Returns False if the key isn't ours."""
+        cur, k, mods = self.text.cursor, e.key(), e.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        mode = (QTextCursor.MoveMode.KeepAnchor if mods & Qt.KeyboardModifier.ShiftModifier
+                else QTextCursor.MoveMode.MoveAnchor)
+        Op = QTextCursor.MoveOperation
+        moves = {Qt.Key.Key_Left: Op.WordLeft if ctrl else Op.Left,
+                 Qt.Key.Key_Right: Op.WordRight if ctrl else Op.Right,
+                 Qt.Key.Key_Up: Op.Up, Qt.Key.Key_Down: Op.Down,
+                 Qt.Key.Key_Home: Op.Start if ctrl else Op.StartOfLine,
+                 Qt.Key.Key_End: Op.End if ctrl else Op.EndOfLine}
+        cb = QApplication.clipboard()
+        if k in moves:
+            cur.movePosition(moves[k], mode)
+        elif k == Qt.Key.Key_Backspace:
+            cur.deletePreviousChar()
+        elif k == Qt.Key.Key_Delete:
+            cur.deleteChar()
+        elif k in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            cur.insertBlock()
+        elif k == Qt.Key.Key_Escape:
+            self.commit_text()
+            return True
+        elif ctrl and k == Qt.Key.Key_A:
+            cur.select(QTextCursor.SelectionType.Document)
+        elif ctrl and k in (Qt.Key.Key_C, Qt.Key.Key_X):
+            if cur.hasSelection():
+                cb.setText(cur.selectedText().replace("\u2029", "\n"))
+                if k == Qt.Key.Key_X:
+                    cur.removeSelectedText()
+        elif ctrl and k == Qt.Key.Key_V:
+            cur.insertText(cb.text())
+        elif ctrl and k == Qt.Key.Key_Z:
+            self.text.doc.undo(cur)
+        elif ctrl and k == Qt.Key.Key_Y:
+            self.text.doc.redo(cur)
+        elif e.text() and e.text().isprintable() and not ctrl:
+            cur.insertText(e.text())
+        else:
+            return False
+        self.update()
+        return True
+
+    def event(self, e):
+        # While typing, keys like S/P/Del/Ctrl+V belong to the text box, not to
+        # the window's tool and edit shortcuts.
+        if e.type() == e.Type.ShortcutOverride and self.text is not None:
+            mods = e.modifiers() & ~Qt.KeyboardModifier.ShiftModifier & ~Qt.KeyboardModifier.KeypadModifier
+            plain = mods == Qt.KeyboardModifier.NoModifier
+            ctrl_keys = (Qt.Key.Key_A, Qt.Key.Key_C, Qt.Key.Key_X, Qt.Key.Key_V, Qt.Key.Key_Z,
+                         Qt.Key.Key_Y, Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Home, Qt.Key.Key_End)
+            if (plain and (e.text().isprintable() and e.text()
+                           or e.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete, Qt.Key.Key_Escape,
+                                          Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Left,
+                                          Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down,
+                                          Qt.Key.Key_Home, Qt.Key.Key_End))
+                    or (mods == Qt.KeyboardModifier.ControlModifier and e.key() in ctrl_keys)):
+                e.accept()
+                return True
+        return super().event(e)
 
     def lift(self, leave_hole=True):
         if not self.sel or self.floating is not None:
@@ -435,8 +681,10 @@ class Canvas(QWidget):
         p.end()
 
     def commit(self):
-        if self.drag and self.drag["kind"] in ("move_sel", "resize_sel", "select_new"):
+        self.commit_text()
+        if self.drag and self.drag["kind"] in ("move_sel", "resize_sel", "select_new", "rotate_sel"):
             self.drag = None
+        self.rot = None
         if self.floating is not None:
             self.stamp()
             self.touch()
@@ -578,6 +826,7 @@ class Canvas(QWidget):
     def set_tool(self, t):
         if t == self.tool:
             return
+        self.commit_text()
         if t != "select":
             self.commit()
         if t == "picker":
@@ -586,47 +835,95 @@ class Canvas(QWidget):
         self.update_cursor()
         self.toolChanged.emit(t)
 
+    RESIZE_CURSORS = {"n": Qt.CursorShape.SizeVerCursor, "s": Qt.CursorShape.SizeVerCursor,
+                      "e": Qt.CursorShape.SizeHorCursor, "w": Qt.CursorShape.SizeHorCursor,
+                      "nw": Qt.CursorShape.SizeFDiagCursor, "se": Qt.CursorShape.SizeFDiagCursor,
+                      "ne": Qt.CursorShape.SizeBDiagCursor, "sw": Qt.CursorShape.SizeBDiagCursor}
+
     def update_cursor(self, pos=None):
-        c = Qt.CursorShape.CrossCursor
+        c = Qt.CursorShape.IBeamCursor if self.tool == "text" else Qt.CursorShape.CrossCursor
         if pos is not None:
             h = self.canvas_handle_at(pos)
             if h:
-                c = {"e": Qt.CursorShape.SizeHorCursor, "s": Qt.CursorShape.SizeVerCursor,
-                     "se": Qt.CursorShape.SizeFDiagCursor}[h]
-            elif self.tool == "select":
-                h = self.sel_handle_at(pos)
+                c = self.RESIZE_CURSORS[h]
+            elif self.tool == "select" and self.sel and self.on_rot_knob(pos):
+                c = Qt.CursorShape.PointingHandCursor
+            elif self.tool == "select" and self.sel and self.handle_at(self.sel, pos):
+                c = self.RESIZE_CURSORS[self.handle_at(self.sel, pos)]
+            elif self.tool == "select" and self.sel and QRectF(self.sel).contains(self.to_img(pos)):
+                c = Qt.CursorShape.SizeAllCursor
+            elif self.text:
+                h = self.handle_at(self.text.rect, pos)
                 if h:
-                    c = {"n": Qt.CursorShape.SizeVerCursor, "s": Qt.CursorShape.SizeVerCursor,
-                         "e": Qt.CursorShape.SizeHorCursor, "w": Qt.CursorShape.SizeHorCursor,
-                         "nw": Qt.CursorShape.SizeFDiagCursor, "se": Qt.CursorShape.SizeFDiagCursor,
-                         "ne": Qt.CursorShape.SizeBDiagCursor, "sw": Qt.CursorShape.SizeBDiagCursor}[h]
-                elif self.sel and QRectF(self.sel).contains(self.to_img(pos)):
+                    c = self.RESIZE_CURSORS[h]
+                elif self.on_text_border(pos):
                     c = Qt.CursorShape.SizeAllCursor
         self.setCursor(c)
 
-    def canvas_handle_at(self, pos):
+    def canvas_handles(self):
+        """Win7 Paint's three canvas handles: right edge, bottom edge, corner.
+        Each sits just outside the image, centred on its edge."""
         r = self.to_widget(self.image.rect())
-        for name, pt in (("se", r.bottomRight()), ("e", QPointF(r.right(), r.center().y())),
-                         ("s", QPointF(r.center().x(), r.bottom()))):
-            if QRectF(pt.x() - 1, pt.y() - 1, HANDLE + 2, HANDLE + 2).contains(pos):
+        k = CANVAS_HANDLE
+        return {"e": QRectF(r.right() + 1, r.center().y() - k / 2, k, k),
+                "s": QRectF(r.center().x() - k / 2, r.bottom() + 1, k, k),
+                "se": QRectF(r.right() + 1, r.bottom() + 1, k, k)}
+
+    def canvas_handle_at(self, pos):
+        for name, box in self.canvas_handles().items():
+            if box.adjusted(-3, -3, 3, 3).contains(pos):
                 return name
         return None
 
-    def sel_handles(self):
-        r = self.to_widget(self.sel)
+    def handles(self, rect):
+        r = self.to_widget(rect)
         cx, cy = r.center().x(), r.center().y()
         return {"nw": QPointF(r.left(), r.top()), "n": QPointF(cx, r.top()),
                 "ne": QPointF(r.right(), r.top()), "e": QPointF(r.right(), cy),
                 "se": QPointF(r.right(), r.bottom()), "s": QPointF(cx, r.bottom()),
                 "sw": QPointF(r.left(), r.bottom()), "w": QPointF(r.left(), cy)}
 
-    def sel_handle_at(self, pos):
-        if not self.sel:
-            return None
-        for name, pt in self.sel_handles().items():
+    def handle_at(self, rect, pos):
+        for name, pt in self.handles(rect).items():
             if abs(pos.x() - pt.x()) <= HANDLE and abs(pos.y() - pt.y()) <= HANDLE:
                 return name
         return None
+
+    def sel_handle_at(self, pos):
+        return self.handle_at(self.sel, pos) if self.sel else None
+
+    def on_rot_knob(self, pos):
+        k = self.rot_knob()
+        return math.hypot(pos.x() - k.x(), pos.y() - k.y()) <= HANDLE + 2
+
+    def on_text_border(self, pos):
+        """The text box's dashed edge is its move grip (inside is for the caret)."""
+        r = self.to_widget(self.text.rect)
+        return r.adjusted(-5, -5, 5, 5).contains(pos) and not r.adjusted(3, 3, -3, -3).contains(pos)
+
+    def resized_rect(self, o, h, ip, keep_aspect=False):
+        """o with the edges named by handle h dragged to image point ip."""
+        l, t, r, b = o.left(), o.top(), o.left() + o.width(), o.top() + o.height()
+        if "w" in h:
+            l = min(round(ip.x()), r - 1)
+        if "e" in h:
+            r = max(round(ip.x()), l + 1)
+        if "n" in h:
+            t = min(round(ip.y()), b - 1)
+        if "s" in h:
+            b = max(round(ip.y()), t + 1)
+        if keep_aspect and len(h) == 2:
+            k_ = max((r - l) / o.width(), (b - t) / o.height())
+            nw, nh = max(1, round(o.width() * k_)), max(1, round(o.height() * k_))
+            if "w" in h:
+                l = r - nw
+            else:
+                r = l + nw
+            if "n" in h:
+                t = b - nh
+            else:
+                b = t + nh
+        return QRect(l, t, r - l, b - t)
 
     def pen_for(self, color, tool):
         size = self.sizes[tool]
@@ -726,7 +1023,9 @@ class Canvas(QWidget):
                 self.window().context_menu(e.globalPosition().toPoint())
                 return
             h = self.sel_handle_at(pos)
-            if h:
+            if self.sel and self.on_rot_knob(pos):
+                self.drag = self.begin_rotate(ip)
+            elif h:
                 self.drag = {"kind": "resize_sel", "h": h, "orig": QRect(self.sel), "moved": False}
             elif self.sel and QRectF(self.sel).contains(ip):
                 self.drag = {"kind": "move_sel", "start": ip, "orig": QRect(self.sel),
@@ -760,6 +1059,22 @@ class Canvas(QWidget):
         elif t in ("line", "rect"):
             self.drag = {"kind": "shape", "tool": t, "color": color, "start": ip, "end": ip,
                          "shift": bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)}
+        elif t == "text" and btn == Qt.MouseButton.LeftButton:
+            tb = self.text
+            h = self.handle_at(tb.rect, pos) if tb else None
+            if h:
+                self.drag = {"kind": "resize_text", "h": h, "orig": QRect(tb.rect)}
+            elif tb and self.on_text_border(pos):
+                self.drag = {"kind": "move_text", "start": ip, "orig": QRect(tb.rect)}
+            elif tb and QRectF(tb.rect).contains(ip):
+                mode = (QTextCursor.MoveMode.KeepAnchor if e.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                        else QTextCursor.MoveMode.MoveAnchor)
+                tb.cursor.setPosition(tb.hit(ip - QPointF(tb.rect.topLeft())), mode)
+                self.drag = {"kind": "text_select"}
+                self.update()
+            else:
+                self.commit_text()
+                self.drag = {"kind": "text_new", "start": ip, "rect": None}
 
     def mouseMoveEvent(self, e):
         pos = e.position()
@@ -811,30 +1126,37 @@ class Canvas(QWidget):
             if not d["moved"]:
                 d["moved"] = True
                 self.lift()
-            o, h = d["orig"], d["h"]
-            l, t, r, b = o.left(), o.top(), o.left() + o.width(), o.top() + o.height()
-            if "w" in h:
-                l = min(round(ip.x()), r - 1)
-            if "e" in h:
-                r = max(round(ip.x()), l + 1)
-            if "n" in h:
-                t = min(round(ip.y()), b - 1)
-            if "s" in h:
-                b = max(round(ip.y()), t + 1)
-            if len(h) == 2 and e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                k_ = max((r - l) / o.width(), (b - t) / o.height())
-                nw, nh = max(1, round(o.width() * k_)), max(1, round(o.height() * k_))
-                if "w" in h:
-                    l = r - nw
-                else:
-                    r = l + nw
-                if "n" in h:
-                    t = b - nh
-                else:
-                    b = t + nh
-            self.sel = QRect(l, t, r - l, b - t)
+            self.sel = self.resized_rect(d["orig"], d["h"], ip,
+                                         bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier))
             self.update()
             self.emit_sel()
+        elif k == "rotate_sel":
+            c = d["center"]
+            a = d["base"] + math.degrees(math.atan2(ip.y() - c.y(), ip.x() - c.x())) - d["start"]
+            if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                a = round(a / 15) * 15
+            d["angle"] = (a + 180) % 360 - 180
+            self.status.emit("", f"Rotate {d['angle']:.0f}°")
+            self.update()
+        elif k == "text_new":
+            a = d["start"]
+            d["rect"] = QRect(QPoint(round(min(a.x(), ip.x())), round(min(a.y(), ip.y()))),
+                              QPoint(round(max(a.x(), ip.x())) - 1, round(max(a.y(), ip.y())) - 1))
+            self.update()
+        elif k == "resize_text":
+            r = self.resized_rect(d["orig"], d["h"], ip)
+            self.text.rect = QRect(r.topLeft(), QSize(max(12, r.width()), r.height()))
+            self.text.min_h = max(1, r.height())
+            self.text.layout(self.text_font())
+            self.update()
+        elif k == "move_text":
+            self.text.rect.moveTopLeft(d["orig"].topLeft() + QPoint(round(ip.x() - d["start"].x()),
+                                                                    round(ip.y() - d["start"].y())))
+            self.update()
+        elif k == "text_select":
+            tb = self.text
+            tb.cursor.setPosition(tb.hit(ip - QPointF(tb.rect.topLeft())), QTextCursor.MoveMode.KeepAnchor)
+            self.update()
         elif k == "canvas":
             w, h = self.image.width(), self.image.height()
             if "e" in d["which"]:
@@ -868,6 +1190,13 @@ class Canvas(QWidget):
             self.emit_sel()
         elif k == "stroke":
             self.docChanged.emit()
+        elif k == "rotate_sel":
+            self.end_rotate(d)
+        elif k == "text_new":
+            r = d["rect"]
+            if r is None or r.width() < 8:          # a click: a default-width box at that spot
+                r = QRect(QPoint(round(d["start"].x()), round(d["start"].y())), QSize(240, 1))
+            self.new_text(r)
         self.update()
         self.update_cursor(e.position())
 
@@ -887,6 +1216,8 @@ class Canvas(QWidget):
             e.ignore()
 
     def keyPressEvent(self, e):
+        if self.text is not None and self.text_key(e):
+            return
         k = e.key()
         moves = {Qt.Key.Key_Left: (-1, 0), Qt.Key.Key_Right: (1, 0),
                  Qt.Key.Key_Up: (0, -1), Qt.Key.Key_Down: (0, 1)}
@@ -905,15 +1236,13 @@ class Canvas(QWidget):
         super().keyPressEvent(e)
 
     def paintEvent(self, e):
-        if self._dpr != self.dpr():
-            first = self._dpr is None
-            self._dpr = self.dpr()
-            if not first:
-                QTimer.singleShot(0, self.update_size)
+        if self._size_dpr is not None and abs(self._size_dpr - self.dpr()) > 1e-6:
+            QTimer.singleShot(0, self.update_size)      # moved to a screen with other scaling
         p = QPainter(self)
         p.fillRect(e.rect(), self.workspace)
         s = self.scale()
         W, H = self.image.width(), self.image.height()
+        d = self.drag
         p.save()
         p.translate(MARGIN, MARGIN)
         p.scale(s, s)
@@ -922,38 +1251,79 @@ class Canvas(QWidget):
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.zoom < 1)
         p.drawImage(QRectF(0, 0, W, H), self.image)
         p.setClipRect(QRectF(0, 0, W, H))
-        if self.floating is not None:
+        if d and d["kind"] == "rotate_sel":
+            self.draw_rotating(p)
+        elif self.floating is not None:
             self.draw_floating(p)
-        if self.drag and self.drag["kind"] == "shape":
+        if d and d["kind"] == "shape":
             self.draw_shape(p)
+        if self.text:
+            p.drawImage(QPointF(self.text.rect.topLeft()), self.text_image(caret=self.hasFocus()))
         p.restore()
-        # overlays, in widget coordinates
+
+        # ---- overlays, in widget coordinates
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        if self.sel:
-            r = self.to_widget(self.sel).adjusted(-0.5, -0.5, 0.5, 0.5)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.setPen(QPen(QColor("white"), 0))
-            p.drawRect(r)
-            dash = QPen(QColor("#1e5fd8"), 0, Qt.PenStyle.DashLine)
-            p.setPen(dash)
-            p.drawRect(r)
-            if not (self.drag and self.drag["kind"] == "select_new"):
-                p.setPen(QPen(QColor("#1e5fd8"), 0))
-                p.setBrush(QColor("white"))
-                for pt in self.sel_handles().values():
-                    p.drawRect(QRectF(pt.x() - HANDLE / 2, pt.y() - HANDLE / 2, HANDLE, HANDLE))
+        blue = QColor("#1e5fd8")
         r = self.to_widget(self.image.rect())
-        p.setPen(QPen(QColor("#5a6f8f"), 0))
-        p.setBrush(QColor("white"))
-        for pt in (r.bottomRight(), QPointF(r.right(), r.center().y()), QPointF(r.center().x(), r.bottom())):
-            p.drawRect(QRectF(pt.x(), pt.y(), HANDLE - 1, HANDLE - 1))
-        if self.drag and self.drag["kind"] == "canvas":
-            sz = self.drag["size"]
+        p.setPen(QPen(QColor(128, 128, 128, 160), 0))    # canvas edge, visible on any theme
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(r.adjusted(-0.5, -0.5, 0.5, 0.5))     # just outside: never covers a pixel
+
+        def dashed(rect):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.setPen(QPen(QColor("white"), 0))
-            p.drawRect(self.to_widget(QRect(QPoint(0, 0), sz)))
-            p.setPen(QPen(QColor("black"), 0, Qt.PenStyle.DashLine))
-            p.drawRect(self.to_widget(QRect(QPoint(0, 0), sz)))
+            p.drawRect(rect)
+            p.setPen(QPen(blue, 0, Qt.PenStyle.DashLine))
+            p.drawRect(rect)
+
+        def grips(rect):
+            p.setPen(QPen(blue, 0))
+            p.setBrush(QColor("white"))
+            for pt in self.handles(rect).values():
+                p.drawRect(QRectF(pt.x() - HANDLE / 2, pt.y() - HANDLE / 2, HANDLE, HANDLE))
+
+        if d and d["kind"] == "rotate_sel":
+            src = self.rot["src"]
+            t = QTransform().translate(d["center"].x(), d["center"].y()).rotate(d["angle"])
+            poly = t.map(QPolygonF(QRectF(-src.width() / 2, -src.height() / 2, src.width(), src.height())))
+            poly = QTransform().translate(MARGIN, MARGIN).scale(s, s).map(poly)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor("white"), 0))
+            p.drawPolygon(poly)
+            p.setPen(QPen(blue, 0, Qt.PenStyle.DashLine))
+            p.drawPolygon(poly)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        elif self.sel:
+            dashed(self.to_widget(self.sel).adjusted(-0.5, -0.5, 0.5, 0.5))
+            if not (d and d["kind"] == "select_new"):
+                grips(self.sel)
+                if self.tool == "select":                  # free-rotation knob on a stem
+                    k = self.rot_knob()
+                    sr = self.to_widget(self.sel)
+                    edge = sr.top() if k.y() < sr.top() else sr.bottom()
+                    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+                    p.setPen(QPen(blue, 0))
+                    p.drawLine(QPointF(k.x(), edge), k)
+                    p.setBrush(QColor("white"))
+                    p.drawEllipse(k, HANDLE - 1, HANDLE - 1)
+                    p.setBrush(blue)
+                    p.drawEllipse(k, 1.5, 1.5)
+                    p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        if self.text:
+            dashed(self.to_widget(self.text.rect).adjusted(-0.5, -0.5, 0.5, 0.5))
+            grips(self.text.rect)
+        if d and d["kind"] == "text_new" and d["rect"] is not None:
+            dashed(self.to_widget(d["rect"]))
+
+        # canvas resize handles: big, light, outlined, so they read on dark themes too
+        p.setPen(QPen(QColor("#2b4f8c"), 0))
+        p.setBrush(QColor("white"))
+        for box in self.canvas_handles().values():
+            p.drawRect(box)
+        if d and d["kind"] == "canvas":
+            sz = d["size"]
+            dashed(self.to_widget(QRect(QPoint(0, 0), sz)))
         p.end()
 
 
@@ -987,6 +1357,50 @@ class PaletteGrid(QWidget):
         cs = self.colors()
         if 0 <= i < len(cs) and cs[i] is not None:
             self.picked.emit(cs[i], e.button() == Qt.MouseButton.RightButton)
+
+
+class SizePicker(QToolButton):
+    """Paint's size dropdown: each size is shown as a dot that big, not a number."""
+    picked = pyqtSignal(int)
+
+    def __init__(self):
+        super().__init__()
+        self.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.setAutoRaise(True)
+        self.setIconSize(QSize(40, 30))
+        self.popup = QMenu(self)
+        self.box = QWidget()
+        self.lay = QVBoxLayout(self.box)
+        self.lay.setContentsMargins(2, 2, 2, 2)
+        self.lay.setSpacing(0)
+        wa = QWidgetAction(self.popup)
+        wa.setDefaultWidget(self.box)
+        self.popup.addAction(wa)
+        self.setMenu(self.popup)
+        self.buttons = []
+
+    def show_sizes(self, sizes, current, square, color):
+        for b in self.buttons:
+            b.deleteLater()
+        self.buttons = []
+        for sz in sizes:
+            b = QToolButton()
+            b.setAutoRaise(True)
+            b.setCheckable(True)
+            b.setChecked(sz == current)
+            b.setIconSize(QSize(64, 30))
+            b.setIcon(size_icon(sz, square, 64, 30, color))
+            b.setToolTip(f"{sz} px")
+            b.clicked.connect(lambda _=False, sz=sz: self.choose(sz))
+            self.lay.addWidget(b)
+            self.buttons.append(b)
+        self.setEnabled(bool(sizes))
+        self.setIcon(size_icon(current, square, 40, 30, color) if sizes else QIcon())
+        self.setToolTip(f"Size: {current} px" if sizes else "")
+
+    def choose(self, sz):
+        self.popup.close()
+        self.picked.emit(sz)
 
 
 class CanvasSizeDialog(QDialog):
@@ -1168,8 +1582,7 @@ class MainWindow(QMainWindow):
         lab.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         lab.setEnabled(False)
         v.addWidget(lab)
-        tb.addWidget(w)
-        tb.addSeparator()
+        return [tb.addWidget(w), tb.addSeparator()]
 
     def row(self, *widgets, vertical=False, grid_cols=0):
         w = QWidget()
@@ -1201,13 +1614,12 @@ class MainWindow(QMainWindow):
                        menu=[self.a_rot_r, self.a_rot_l, self.a_rot_180, self.a_flip_h, self.a_flip_v]),
                      vertical=True)))
         self.ribbon_group(tb, "Tools", self.row(
-            *[b(self.tool_actions[t]) for t in ("pencil", "fill", "picker", "line",
-                                                 "brush", "eraser", "rect")],
+            *[b(self.tool_actions[t]) for t in ("pencil", "fill", "picker", "text",
+                                                 "brush", "eraser", "line", "rect")],
             grid_cols=4))
-        self.size_combo = QComboBox()
-        self.size_combo.activated.connect(self.on_size)
-        size_w = self.row(self.size_combo, vertical=True)
-        self.ribbon_group(tb, "Size", size_w)
+        self.size_picker = SizePicker()
+        self.size_picker.picked.connect(self.on_size)
+        self.ribbon_group(tb, "Size", self.row(self.size_picker, vertical=True))
         self.slot_btns = {}
         for slot in (1, 2):
             sb = QToolButton()
@@ -1223,6 +1635,70 @@ class MainWindow(QMainWindow):
         edit = b(text="Edit\ncolors", icons=["color-management", "preferences-desktop-color"], big=True)
         edit.clicked.connect(self.edit_colors)
         self.ribbon_group(tb, "Colors", self.row(self.slot_btns[1], self.slot_btns[2], self.grid, edit))
+        # Text formatting gets its own row, shown only with the Text tool (like
+        # Win7's contextual Text tab), so it never pushes Colors off-screen.
+        self.addToolBarBreak()
+        self.text_bar = QToolBar("Text")
+        self.text_bar.setMovable(False)
+        self.addToolBar(self.text_bar)
+        self.ribbon_group(self.text_bar, "Text", self.build_text_controls())
+
+    def createPopupMenu(self):
+        return None             # no right-click menu for hiding the ribbon rows
+
+    def build_text_controls(self):
+        """Win7's contextual Text tab, as a ribbon group shown with the Text tool."""
+        st = self.canvas.text_style
+        fonts = available_fonts()
+        saved = self.settings.value("text_font", "")
+        st["family"] = saved if saved in fonts else next(
+            (f for f in ("Noto Sans", "DejaVu Sans", "Liberation Sans") if f in fonts), fonts[0])
+        st["pt"] = self.settings.value("text_pt", 12, type=int)
+        self.font_box = QComboBox()
+        self.font_box.addItems(fonts)
+        self.font_box.setCurrentText(st["family"])
+        for i, f in enumerate(fonts):
+            self.font_box.setItemData(i, QFont(f), Qt.ItemDataRole.FontRole)   # preview each font
+        self.font_box.currentTextChanged.connect(lambda f: self.text_style(family=f))
+        self.pt_box = QComboBox()
+        self.pt_box.setEditable(True)
+        self.pt_box.setValidator(QIntValidator(4, 500, self))
+        self.pt_box.addItems([str(n) for n in FONT_SIZES])
+        self.pt_box.setCurrentText(str(st["pt"]))
+        self.pt_box.setMaximumWidth(64)
+        self.pt_box.currentTextChanged.connect(
+            lambda t: t.isdigit() and int(t) >= 4 and self.text_style(pt=int(t)))
+
+        def toggle(key, label, icons, style=None):
+            btn = QToolButton()
+            btn.setCheckable(True)
+            btn.setAutoRaise(True)
+            btn.setToolTip(label)
+            ic = icon(icons)
+            if ic.isNull():
+                btn.setText(label[0] if style else label)
+                if style:
+                    f = btn.font()
+                    style(f)
+                    btn.setFont(f)
+            else:
+                btn.setIcon(ic)
+            btn.toggled.connect(lambda on: self.text_style(**{key: on}))
+            return btn
+        bold = toggle("bold", "Bold", ["format-text-bold"], lambda f: f.setBold(True))
+        italic = toggle("italic", "Italic", ["format-text-italic"], lambda f: f.setItalic(True))
+        under = toggle("underline", "Underline", ["format-text-underline"], lambda f: f.setUnderline(True))
+        opaque = toggle("opaque", "Opaque background (Color 2)", ["format-fill-color", "fill-color"])
+        opaque.setText("Opaque")
+        opaque.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        return self.row(self.font_box, self.pt_box, bold, italic, under, opaque)
+
+    def text_style(self, **kw):
+        self.canvas.set_text_style(**kw)
+        if "family" in kw:
+            self.settings.setValue("text_font", kw["family"])
+        if "pt" in kw:
+            self.settings.setValue("text_pt", kw["pt"])
 
     def build_status(self):
         sb = self.statusBar()
@@ -1261,16 +1737,13 @@ class MainWindow(QMainWindow):
 
     def on_tool_changed(self, t):
         self.tool_actions[t].setChecked(True)
-        sizes = TOOLS[t][4]
-        self.size_combo.clear()
-        self.size_combo.setEnabled(bool(sizes))
-        for s in sizes:
-            self.size_combo.addItem(f"{s} px", s)
-        if sizes:
-            self.size_combo.setCurrentIndex(sizes.index(self.canvas.sizes[t]))
+        self.size_picker.show_sizes(TOOLS[t][4], self.canvas.sizes[t], t == "eraser",
+                                    self.palette().color(QPalette.ColorRole.WindowText))
+        self.text_bar.setVisible(t == "text")
 
-    def on_size(self, i):
-        self.canvas.sizes[self.canvas.tool] = self.size_combo.itemData(i)
+    def on_size(self, sz):
+        self.canvas.sizes[self.canvas.tool] = sz
+        self.on_tool_changed(self.canvas.tool)
         self.canvas.setFocus()
 
     def refresh_colors(self):
@@ -1479,6 +1952,8 @@ class MainWindow(QMainWindow):
     def changeEvent(self, e):
         if e.type() in (e.Type.PaletteChange, e.Type.ApplicationPaletteChange) and hasattr(self, "canvas"):
             self.apply_workspace_color()
+            if hasattr(self, "size_picker"):
+                self.on_tool_changed(self.canvas.tool)
         super().changeEvent(e)
 
     # ---- updates ---------------------------------------------------
