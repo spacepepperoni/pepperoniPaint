@@ -21,37 +21,37 @@ scaling (e.g. 215%), so screenshots show at their real size and are never resamp
 
 ## Install
 
+Paste this into a terminal:
+
 ```sh
-sudo apt install python3-pyqt6      # Debian      (Fedora: sudo dnf install python3-pyqt6)
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/spacepepperoni/pepperoniPaint/main/get.sh | bash
 ```
 
-No root, or Steam Deck: `./install.sh --venv` puts PyQt6 in a private venv.
-Run `./install.sh` again after pulling updates.
+Then open **pepperoniPaint** from your app menu.
 
-## Other devices (pull-only, auto-updating)
+- Installs for your user only. The only thing that may ask for your password is
+  installing PyQt6 (and git) from your distro if they're missing. If that isn't possible
+  (e.g. on a Steam Deck), it downloads a private copy of PyQt6 instead.
+- **Updates are automatic.** A small background timer checks GitHub about 10 minutes
+  after you log in and then every 6 hours, and reinstalls only when there's something new.
+  An already-open window keeps the old version until you reopen it.
+  To update right now, run the same command again.
 
-Each device gets its own **read-only deploy key**: an SSH key that can pull this
-one repo and nothing else, so no GitHub login is stored on the device.
+### Uninstall
 
-1. Make the key and print it:
-   ```sh
-   ssh-keygen -t ed25519 -N "" -f ~/.ssh/pepperonipaint_deploy -C "pepperoniPaint@$(hostname)"
-   cat ~/.ssh/pepperonipaint_deploy.pub
-   ```
-2. Add that line on GitHub: repo → **Settings → Deploy keys → Add deploy key**.
-   Leave *Allow write access* unticked.
-3. Clone and install with auto-update:
-   ```sh
-   key='ssh -i ~/.ssh/pepperonipaint_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
-   GIT_SSH_COMMAND="$key" git clone git@github.com:spacepepperoni/pepperoniPaint.git ~/pepperoniPaint
-   git -C ~/pepperoniPaint config core.sshCommand "$key"
-   cd ~/pepperoniPaint && ./install.sh --auto-update
-   ```
-   Install PyQt6 first (`sudo apt install python3-pyqt6` / `sudo dnf install python3-pyqt6`).
-   On a Steam Deck, skip that: `install.sh` detects SteamOS and uses its own venv.
+```sh
+systemctl --user disable --now pepperonipaint-update.timer
+rm -rf ~/.local/share/pepperoniPaint ~/.local/bin/pepperonipaint \
+  ~/.local/share/applications/pepperonipaint.desktop \
+  ~/.local/share/icons/hicolor/scalable/apps/pepperonipaint.svg \
+  ~/.config/systemd/user/pepperonipaint-update.*
+```
 
-The `pepperonipaint-update` timer checks about 10 minutes after login and then every
-6 hours. It pulls and reinstalls only when something changed. An already-open window
-keeps the old version until you reopen it. To update right now, run `~/pepperoniPaint/update.sh`;
-for its log, run `journalctl --user -u pepperonipaint-update`.
+## Development
+
+Work in a clone and run `./install.sh` after each change (`--venv` if PyQt6 isn't
+installed system-wide). Pushes to `main` reach every auto-updating install.
+
+## License
+
+MIT

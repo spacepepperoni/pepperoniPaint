@@ -100,8 +100,10 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 UNIT
-  systemctl --user daemon-reload
-  systemctl --user enable --now pepperonipaint-update.timer
-  echo "Auto-update on: checks ~10 min after login, then every 6 h (journalctl --user -u pepperonipaint-update)"
+  if systemctl --user daemon-reload && systemctl --user enable --now pepperonipaint-update.timer; then
+    echo "Auto-update on: checks ~10 min after login, then every 6 h (journalctl --user -u pepperonipaint-update)"
+  else
+    echo "Couldn't turn on auto-update (no systemd user session?). Update by hand with: $here/update.sh"
+  fi
 fi
 echo "Installed. Launch \"pepperoniPaint\" from the app menu, or run: $bin/pepperonipaint [file]"
