@@ -38,6 +38,7 @@ fi
 if (( uninstall )); then
   rm -rf "$dest" "$bin/pepperonipaint" "$share/applications/pepperonipaint.desktop" \
          "$share/icons/hicolor/scalable/apps/pepperonipaint.svg"
+  rm -f "$share"/icons/hicolor/*/apps/pepperonipaint.png
   refresh_menus
   echo "pepperoniPaint is uninstalled."
   exit 0
@@ -80,6 +81,14 @@ mkdir -p "$dest" "$bin" "$share/applications" "$share/icons/hicolor/scalable/app
 install -m 644 "$here/pepperoni_paint.py" "$dest/pepperoni_paint.py"
 install -m 644 "$here/pepperonipaint.svg" "$dest/pepperonipaint.svg"
 install -m 644 "$here/pepperonipaint.svg" "$share/icons/hicolor/scalable/apps/pepperonipaint.svg"
+# PNGs as well as the SVG: every desktop can show a PNG, with or without Qt's
+# SVG plugin, and the window icon is built from these.
+mkdir -p "$dest/icons"
+for png in "$here"/icons/pepperonipaint-*.png; do
+  size=$(basename "$png" .png); size=${size#pepperonipaint-}
+  install -m 644 "$png" "$dest/icons/"
+  install -Dm 644 "$png" "$share/icons/hicolor/${size}x${size}/apps/pepperonipaint.png"
+done
 printf '%s\n' "$here" > "$dest/source-path"     # where the app's updater pulls from
 cat > "$bin/pepperonipaint" <<LAUNCH
 #!/bin/sh
@@ -95,7 +104,7 @@ Name=pepperoniPaint
 GenericName=Paint
 Comment=Paste, select, move and draw — a Windows 7-style Paint
 Exec="$bin/pepperonipaint" %f
-Icon=$dest/pepperonipaint.svg
+Icon=$dest/icons/pepperonipaint-256.png
 Terminal=false
 Categories=Graphics;2DGraphics;RasterGraphics;
 MimeType=image/png;image/jpeg;image/bmp;image/webp;image/gif;

@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDialog,
                              QToolButton, QVBoxLayout, QWidget, QWidgetAction)
 
 APP = "pepperoniPaint"
-__version__ = "0.3.0"       # bump to release: installs only offer updates when this goes up
+__version__ = "0.3.1"       # bump to release: installs only offer updates when this goes up
 REPO_URL = "https://github.com/spacepepperoni/pepperoniPaint"
 INSTALL_DIR = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), APP)
 UPDATE_EVERY_MS = 6 * 60 * 60 * 1000
@@ -2036,10 +2036,14 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP)
     app.setDesktopFileName("pepperonipaint")
-    for ico in (os.path.join(INSTALL_DIR, "pepperonipaint.svg"),
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), "pepperonipaint.svg")):
-        if os.path.isfile(ico):
-            app.setWindowIcon(QIcon(ico))
+    for d in (os.path.join(INSTALL_DIR, "icons"),
+              os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")):
+        pngs = sorted(f for f in os.listdir(d) if f.endswith(".png")) if os.path.isdir(d) else []
+        if pngs:
+            ico = QIcon()
+            for f in pngs:
+                ico.addFile(os.path.join(d, f))
+            app.setWindowIcon(ico)
             break
     w = MainWindow()
     w.show()
