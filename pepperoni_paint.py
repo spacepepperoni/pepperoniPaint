@@ -18,7 +18,7 @@ import threading
 from PyQt6.QtCore import (QPoint, QPointF, QProcess, QRect, QRectF, QSettings, QSize,
                           QObject, Qt, QTimer, pyqtSignal)
 from PyQt6.QtGui import (QAbstractTextDocumentLayout, QAction, QActionGroup,
-                         QColor, QCursor, QFont, QFontDatabase, QIcon, QImage,
+                         QColor, QFont, QFontDatabase, QIcon, QImage,
                          QImageReader, QImageWriter, QIntValidator, QKeySequence,
                          QPainter, QPalette, QPen, QPixmap, QPolygonF, QTextCharFormat,
                          QTextCursor, QTextDocument, QTransform)
